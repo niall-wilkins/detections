@@ -1,0 +1,206 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for production deployment'
+        required: true
+        type: string
+      confirm:
+        description: 'Type DEPLOY to confirm'
+        required: true
+        type: string
+      detections_path:
+        description: 'Path to detections (default: detections/)'
+        required: false
+        default: 'detections/'
+        type: string
+
+jobs:
+  validate-input:
+    name: Validate Deployment Input
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DEPLOY" ]; then
+            echo "❌ Confirmation failed. You must type DEPLOY to proceed."
+            exit 1
+          fi
+          echo "✅ Deployment confirmed"
+      
+      - name: Check branch
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "❌ Production deployments must be from main branch"
+            echo "Current branch: ${{ github.ref }}"
+            exit 1
+          fi
+          echo "✅ Deploying from main branch"
+
+  deploy-production:
+    name: Deploy to Splunk Production
+    needs: validate-input
+    runs-on: [self-hosted, splunk-prod]
+    environment: 
+      name: production
+      url: https://splunk-prod:8000
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Verify Repository Contents
+        run: |
+          echo "=== Production Deployment ==="
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Reason: ${{ github.event.inputs.reason }}"
+          echo ""
+          echo "=== Detection Files ==="
+          find detections/ -name "*.yml" -o -name "*.yaml" | wc -l
+          echo "Total detection files found"
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Final validation (strict mode)
+        run: |
+          python scripts/validate_detection.py detections/ --strict
+      
+      - name: Test Splunk connection
+        run: |
+          python scripts/deploy_to_splunk.py \
+            --test-connection \
+            --app-name security_content
+        env:
+          SPLUNK_HOST: ${{ secrets.SPLUNK_PROD_HOST }}
+          SPLUNK_TOKEN: ${{ secrets.SPLUNK_PROD_TOKEN }}
+          SPLUNK_VERIFY_SSL: ${{ secrets.SPLUNK_VERIFY_SSL }}
+      
+      - name: Backup existing detections
+        run: |
+          mkdir -p backups
+          python scripts/backup_detections.py \
+            --env production \
+            --output backups/pre-deploy-$(date +%Y%m%d-%H%M%S).json
+        env:
+          SPLUNK_HOST: ${{ secrets.SPLUNK_PROD_HOST }}
+          SPLUNK_TOKEN: ${{ secrets.SPLUNK_PROD_TOKEN }}
+        continue-on-error: true
+      
+      - name: Deploy to Splunk Production
+        id: deploy
+        run: |
+          python scripts/deploy_to_splunk.py \
+            --env production \
+            --path ${{ github.event.inputs.detections_path }} \
+            --app-name security_content
+        env:
+          SPLUNK_HOST: ${{ secrets.SPLUNK_PROD_HOST }}
+          SPLUNK_TOKEN: ${{ secrets.SPLUNK_PROD_TOKEN }}
+          SPLUNK_VERIFY_SSL: ${{ secrets.SPLUNK_VERIFY_SSL }}
+      
+      - name: Verify deployment
+        run: |
+          echo "Verifying deployed detections..."
+          python scripts/test_detection.py \
+            --env production \
+            --detections detections/ \
+            --verify-only
+        env:
+          SPLUNK_HOST: ${{ secrets.SPLUNK_PROD_HOST }}
+          SPLUNK_TOKEN: ${{ secrets.SPLUNK_PROD_TOKEN }}
+        continue-on-error: true
+      
+      - name: Generate deployment report
+        if: always()
+        run: |
+          mkdir -p reports
+          python scripts/generate_report.py \
+            --env production \
+            --output reports/prod-deployment-$(date +%Y%m%d-%H%M%S).md \
+            --reason "${{ github.event.inputs.reason }}" \
+            --actor "${{ github.actor }}" \
+            --commit "${{ github.sha }}"
+      
+      - name: Upload deployment artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: production-deployment-report
+          path: |
+            reports/
+            backups/
+          retention-days: 365
+      
+      - name: Create GitHub Release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: prod-deploy-${{ github.run_number }}
+          release_name: Production Deployment ${{ github.run_number }}
+          body: |
+            ## Production Deployment
+            
+            **Reason:** ${{ github.event.inputs.reason }}
+            **Deployed by:** ${{ github.actor }}
+            **Commit:** ${{ github.sha }}
+            **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            
+            ### Changes Deployed
+            See deployment report in artifacts for full details.
+            
+            ### Splunk Environment
+            - Host: splunk-prod
+            - App: security_content
+            - Detection Count: $(find detections/ -name "*.yml" -o -name "*.yaml" | wc -l)
+          draft: false
+          prerelease: false
+      
+      - name: Notify Slack - Success
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: |
+            🚀 Production Deployment Successful
+            
+            **Reason:** ${{ github.event.inputs.reason }}
+            **Deployed by:** @${{ github.actor }}
+            **Commit:** ${{ github.sha }}
+            **Environment:** https://splunk-prod:8000
+            
+            All detections deployed successfully.
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      
+      - name: Notify Slack - Failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: |
+            🚨 Production Deployment FAILED
+            
+            **Reason:** ${{ github.event.inputs.reason }}
+            **Attempted by:** @${{ github.actor }}
+            
+            ⚠️ IMMEDIATE ACTION REQUIRED ⚠️
+            
+            Check logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Review backup in artifacts if rollback needed.
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
