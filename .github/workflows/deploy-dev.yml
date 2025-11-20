@@ -1,0 +1,125 @@
+name: Deploy to Dev
+
+on:
+  push:
+    branches:
+      - develop
+      - feature/**
+    paths:
+      - 'detections/**'
+  workflow_dispatch:
+    inputs:
+      detections_path:
+        description: 'Path to detections (default: detections/)'
+        required: false
+        default: 'detections/'
+
+jobs:
+  deploy-dev:
+    name: Deploy to Splunk Dev
+    runs-on: [self-hosted, splunk-dev]
+    environment: 
+      name: development
+      url: https://splunk-dev:8000
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Verify Repository Contents
+        run: |
+          echo "=== Repository Structure ==="
+          ls -la
+          echo ""
+          echo "=== Detection Files ==="
+          find detections/ -name "*.yml" -o -name "*.yaml"
+          echo ""
+          echo "=== Scripts ==="
+          ls -la scripts/
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Validate detections
+        run: |
+          python scripts/validate_detection.py detections/
+      
+      - name: Test Splunk connection
+        run: |
+          python scripts/deploy_to_splunk.py \
+            --test-connection \
+            --app-name security_content
+        env:
+          SPLUNK_HOST: ${{ secrets.SPLUNK_DEV_HOST }}
+          SPLUNK_TOKEN: ${{ secrets.SPLUNK_DEV_TOKEN }}
+          SPLUNK_VERIFY_SSL: 'false'
+      
+      - name: Deploy to Splunk Dev
+        run: |
+          python scripts/deploy_to_splunk.py \
+            --env development \
+            --path ${{ github.event.inputs.detections_path || 'detections/' }} \
+            --app-name security_content
+        env:
+          SPLUNK_HOST: ${{ secrets.SPLUNK_DEV_HOST }}
+          SPLUNK_TOKEN: ${{ secrets.SPLUNK_DEV_TOKEN }}
+          SPLUNK_VERIFY_SSL: 'false'
+      
+      - name: Test deployed detections
+        run: |
+          python scripts/test_detection.py \
+            --env dev \
+            --detections detections/
+        env:
+          SPLUNK_HOST: ${{ secrets.SPLUNK_DEV_HOST }}
+          SPLUNK_TOKEN: ${{ secrets.SPLUNK_DEV_TOKEN }}
+        continue-on-error: true
+      
+      - name: Generate deployment report
+        if: always()
+        run: |
+          mkdir -p reports
+          python scripts/generate_report.py \
+            --env development \
+            --output reports/dev-deployment-$(date +%Y%m%d-%H%M%S).md
+      
+      - name: Upload deployment report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: dev-deployment-report
+          path: reports/
+          retention-days: 30
+      
+      - name: Notify Slack - Success
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: |
+            ✅ Dev Deployment Successful
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+            View: https://splunk-dev:8000
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      
+      - name: Notify Slack - Failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: |
+            ❌ Dev Deployment Failed
+            Branch: ${{ github.ref_name }}
+            Actor: ${{ github.actor }}
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
